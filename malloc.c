@@ -3,26 +3,35 @@
 #include "common.h"
 
 //////////////////////////////////////////////////////////////////////////////////
-//modify 1st: apleilx @ 2017/11/25
+//modify 1st: apleilx @ 2020/2/19
 //All rights reserved
 //////////////////////////////////////////////////////////////////////////////////
 
 /*mem1内存参数设定.mem1完全处于内部SRAM里面.*/
-#define MEM_BLOCK_SIZE (4UL * 1024UL)                        //内存块大小
-#define MEM_MAX_SIZE (8UL * 1024UL * 1024UL)                 //最大管理内存
-#define MEM_ALLOC_TABLE_SIZE (MEM_MAX_SIZE / MEM_BLOCK_SIZE) //内存表大小
+#define mem_block_size (1UL * 1024UL)                        //内存块大小
+#define mem_size (8UL * 1024UL * 1024UL)                     //最大管理内存
+#define mem_table_size (mem_size / mem_block_size)           //内存表大小
 
 /*内存池(32字节对齐)*/
-__align(4) uint8_t mem_base[MEM_MAX_SIZE];
-/*内存管理表,指示已分配的连续内存块个数*/
-uint32_t mem_table[MEM_ALLOC_TABLE_SIZE];
+__align(32) u8 mem_base[mem_size];
 
-/*内存管理参数*/
-#define mem_table_size MEM_ALLOC_TABLE_SIZE /*内存表大小*/
-#define mem_block_size MEM_BLOCK_SIZE       /*内存分块大小*/
-#define mem_size MEM_MAX_SIZE               /*内存总大小*/
+/*内存管理表*/
+u16 mem_table[mem_table_size], *mem_table_base;
 
-static uint8_t my_mem_man_rdy = 0; /*内存管理是否就绪*/
+/*内存管理是否就绪*/
+static u8 my_mem_man_rdy = 0; 
+
+#ifndef NULL
+#define NULL 0
+#endif
+
+void mymemset(void *s, u8 c, u32 count); //设置内存
+void mymemcpy(void *des, void *src, u32 n); //复制内存     
+void my_mem_init(void); //内存管理初始化函数(外/内部调用)
+u32 my_mem_malloc( u32 size); //内存分配(内部调用)
+u8 my_mem_free( u32 offset); //内存释放(内部调用)
+u16 my_mem_perused(void); //获得内存使用率(外/内部调用) 
+
 
 /*
 *********************************************************************************************************
@@ -71,10 +80,10 @@ n:需要复制的内存长度(字节为单位)
 * Return(s)   : none
 *********************************************************************************************************
 */
-void mymemcpy(void *des, void *src, uint32_t n)
+void mymemcpy(void *des, void *src, u32 n)
 {
-    uint8_t *xdes = des;
-    uint8_t *xsrc = src;
+    u8 *xdes = des;
+    u8 *xsrc = src;
     while (n--)
         *xdes++ = *xsrc++;
 }
@@ -89,9 +98,9 @@ void mymemcpy(void *des, void *src, uint32_t n)
 * Return(s)   : none
 *********************************************************************************************************
 */
-void mymemset(void *s, uint8_t c, uint32_t count)
+void mymemset(void *s, u8 c, u32 count)
 {
-    uint8_t *xs = s;
+    u8 *xs = s;
     while (count--)
         *xs++ = c;
 }
@@ -106,7 +115,12 @@ void mymemset(void *s, uint8_t c, uint32_t count)
 */
 void my_mem_init(void)
 {
-    mymemset(mem_table, 0, mem_table_size * 4); //内存状态表数据清零
+    //mem_table_base 使用无cache区
+    mem_table_base = &mem_table[0];
+    mem_table_base = (u16*)((u32)mem_table_base | 0x80000000);
+    
+    //初始化管理表
+    mymemset(mem_table_base, 0, mem_table_size * 4); //内存状态表数据清零
     my_mem_man_rdy = 1;                              //内存管理初始化OK
 }
 
@@ -118,13 +132,13 @@ void my_mem_init(void)
 //返回值:使用率(扩大了10倍,0~1000,代表0.0%~100.0%)
 *********************************************************************************************************
 */
-uint16_t my_mem_perused(void)
+u16 my_mem_perused(void)
 {
-    uint32_t used = 0;
-    uint32_t i;
+    u32 used = 0;
+    u32 i;
     for (i = 0; i < mem_table_size; i++)
     {
-        if (mem_table[i])
+        if (mem_table_base[i])
             used++;
     }
     return (used * 1000) / (mem_table_size);
@@ -139,34 +153,51 @@ uint16_t my_mem_perused(void)
 //返回值:0XFFFFFFFF,代表错误;其他,内存偏移地址
 *********************************************************************************************************
 */
-uint32_t my_mem_malloc(uint32_t size)
+u32 my_mem_malloc(u32 size)
 {
     signed long offset = 0;
-    uint32_t nmemb;     //需要的内存块数
-    uint32_t cmemb = 0; //连续空内存块数
-    uint32_t i;
+    u32 nmemb;     //需要的内存块数
+    u32 cmemb = 0; //连续空内存块数
+    u32 i;
+    
+    //未初始化,先执行初始化
     if (!my_mem_man_rdy)
-        my_mem_init(); //未初始化,先执行初始化
-    if (size == 0)
-        return 0XFFFFFFFF;         //不需要分配
-    nmemb = size / mem_block_size; //获取需要分配的连续内存块数
-    if (size % mem_block_size)
-        nmemb++;
-    for (offset = mem_table_size - 1; offset >= 0; offset--) //搜索整个内存控制区
     {
-        if (!mem_table[offset])
+        my_mem_init(); 
+    }
+    
+    //不需要分配
+    if (size == 0)
+    {
+        return 0XFFFFFFFF;         
+    }
+    
+    //获取需要分配的连续内存块数
+    nmemb = size / mem_block_size; 
+    if (size % mem_block_size)
+    {
+        nmemb++;
+    }
+    
+    //搜索整个内存控制区
+    for (offset = mem_table_size - 1; offset >= 0; offset--) 
+    {
+        if (!mem_table_base[offset])
             cmemb++; //连续空内存块数增加
         else
             cmemb = 0;      //连续内存块清零
-        if (cmemb == nmemb) //找到了连续nmemb个空内存块
+        
+        //找到了连续nmemb个空内存块
+        if (cmemb == nmemb) 
         {
             for (i = 0; i < nmemb; i++) //标注内存块非空
             {
-                mem_table[offset + i] = nmemb;
+                mem_table_base[offset + i] = nmemb;
             }
             return (offset * mem_block_size); //返回偏移地址
         }
     }
+    
     return 0XFFFFFFFF; //未找到符合分配条件的内存块
 }
 
@@ -179,7 +210,7 @@ uint32_t my_mem_malloc(uint32_t size)
 //返回值:0,释放成功;1,释放失败;
 *********************************************************************************************************
 */
-uint8_t my_mem_free(uint32_t offset)
+u8 my_mem_free(u32 offset)
 {
     int i;
     if (!my_mem_man_rdy) //未初始化,先执行初始化
@@ -191,15 +222,18 @@ uint8_t my_mem_free(uint32_t offset)
     if (offset < mem_size) //偏移在内存池内.
     {
         int index = offset / mem_block_size; //偏移所在内存块号码
-        int nmemb = mem_table[index];   //内存块数量
+        int nmemb = mem_table_base[index];   //内存块数量
+        
         for (i = 0; i < nmemb; i++)          //内存块清零
         {
-            mem_table[index + i] = 0;
+            mem_table_base[index + i] = 0;
         }
         return 0;
     }
     else
+    {
         return 2; //偏移超区了.
+    }
 }
 
 /*
@@ -212,17 +246,17 @@ uint8_t my_mem_free(uint32_t offset)
 */
 void myfree(void *ptr)
 {
-    uint32_t offset;
+    u32 offset;
 
     if(osMutexWait(mid_malloc, 3000))
       return;
 
     if (ptr != NULL) //地址为0.
     {
-        offset = (uint32_t)ptr - (uint32_t)(&mem_base[0]);
+        offset = (u32)ptr - (u32)(&mem_base[0]);
         my_mem_free(offset); //释放内存
     }
-
+    
     osMutexRelease(mid_malloc);
 }
 
@@ -235,9 +269,9 @@ void myfree(void *ptr)
 //返回值:分配到的内存首地址.
 *********************************************************************************************************
 */
-void *mymalloc(uint32_t size)
+void *mymalloc(u32 size)
 {
-    uint32_t offset;
+    u32 offset;
     void *pDes;
 
     if(osMutexWait(mid_malloc, 3000))
@@ -247,7 +281,7 @@ void *mymalloc(uint32_t size)
     if (offset == 0XFFFFFFFF)
         pDes = NULL;
     else
-        pDes = (void *)((uint32_t)(&mem_base[0]) + offset);
+        pDes = (void *)((u32)(&mem_base[0]) + offset);
 
     osMutexRelease(mid_malloc);
 
